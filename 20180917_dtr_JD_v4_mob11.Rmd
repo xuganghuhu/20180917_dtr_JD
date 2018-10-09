@@ -1,0 +1,220 @@
+---
+title: "20180917_dtr_JD"
+author: "hu"
+date: "2018年9月17日"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+#载入分析所需要的包
+library(dplyr)
+library(devtools)
+library(woe)   
+library(ROSE)
+library(rpart)
+library(rpart.plot)
+library(ggplot2)
+require(caret)
+library(pROC)
+```
+
+# 京东平台客户高风险决策树分析
+
+本次分析京东平台抓取数据与逾期表现是否有好的决策树模型可以划分，辅助找到逾期客户，降低风险  
+数据字段解释：http://wiki.yxapp.in/pages/viewpage.action?pageId=49123576  
+
+## 数据准备
+由于孙昊给的数据为京东平台相关数据，且有一定重复值，需要去重并匹配我们的风险数据，形成data base
+```{r cars}
+dat_std<-read.csv('v4_jingdongStdBase.csv')
+dat_std<-filter(dat_std,month_decision=='2017-01'|month_decision=='2017-02'|month_decision=='2017-03'|month_decision=='2017-04'|month_decision=='2017-05'|month_decision=='2017-06'|month_decision=='2017-07'|month_decision=='2017-08'|month_decision=='2017-09')
+dat_shop<-read.csv('jingdong_byShop.csv')
+
+dat_dup1<-dat_shop[duplicated(dat_shop$transport_id),]
+dat_dup2<-dat_shop[!duplicated(dat_shop$transport_id),]
+#dim(dat_dup1) #重复的行
+#dim(dat_dup2) #不重复的行
+
+## 想办法把孙昊给的数据去重
+dat_1_1<-summarise(group_by(dat_dup1,transport_id),X=min(X))
+dat_1_1<-select(dat_1_1,-transport_id)
+dat_1_2<-merge(dat_1_1,dat_dup1,by.x ='X',by.y = 'X' ,all=FALSE)
+
+dat_dup2<-select(dat_dup2,-X,-X.1)
+dat_dup3<-select(dat_1_2,-X,-X.1)
+
+dim(dat_dup2)
+dim(dat_dup3)
+
+dat_jd<-rbind(dat_dup2,dat_dup3)
+#dim(dat_jd)
+#write.csv(dat_jd,'D://R_data//dat_jd.csv')
+
+## 逾期表现 left join 京东数据
+dat<-merge(dat_std,dat_jd,by.x='transport_id',by.y='transport_id',all=FALSE)
+#dim(dat)
+#names(dat)
+#head(dat)
+#summary(dat)
+
+## 删掉明显无用的数据，例如：手机号、店铺名等，取可能对建模有效果的变量
+datt1<-select(dat,MobDr1to11_od30,assessment,atv,businessType,cash,credit,gmv_amt,gmv_rstd,income,income_before_wash,limit,limit_before_loan_fluct,loan_amt,loan_balance,loan_cnt,loan_quality,max_active_days,punish_normal_amt,punish_normal_cnt,refund_amt,weight_account,weight_fluct,weight_time)
+
+typeof(datt1$assessment)
+datt1$assessment<-as.numeric(datt1$assessment)
+```
+
+## 计算IV值
+```{r}
+
+#install_github("riv","tomasgreif")
+#library(devtools)
+#library(woe)          
+IV<-iv.mult(datt1,"MobDr1to11_od30",TRUE)   #原理是以Y作为被解释变量，其他作为解释变量，建立决策树模型
+iv.plot.summary(IV)
+#取IV值最高的若干变量作为决策树分析的变量，形成datt4
+#datt4<-select(datt1,MobDr1to6_od30,limit,weight_time,max_active_days,gmv_amt,limit_before_loan_fluct,income_before_wash,atv,income,assessment)
+```
+
+## 数据不平衡的处理方法
+由于京东平台逾期数据量不充足，数据存在严重的不平衡性，可以考虑下采样或者过采样的方法来补充坏样本数据。
+```{r}
+#install.packages("ROSE")
+#library(ROSE)
+# 过采样&下采样
+table(datt1$MobDr1to11_od30)
+data_balanced_both <- ovun.sample(MobDr1to11_od30 ~ ., data = datt1, method = "both", p=0.5,N=1000,seed = 1)$data
+table(data_balanced_both$MobDr1to11_od30)
+
+```
+
+## 开始构建决策树
+```{r}
+#library(rpart)
+
+#设置随机分配，查分数据为train集和test集#
+dat=data_balanced_both
+smp_size <- floor(0.7 * nrow(dat))
+#set.seed(123)  AUC:0.676
+set.seed(123)
+train_ind <- sample(seq_len(nrow(dat)), size = smp_size)
+train <- dat[train_ind, ]
+test <- dat[-train_ind, ]
+dim(train)
+dim(test)
+
+fit<-(MobDr1to11_od30~.)
+rtree<-rpart(fit,minsplit=150, cp=0.02,data=train)
+printcp(rtree)
+
+#library(rpart.plot) #调出rpart.plot包
+rpart.plot(rtree, type=2,cex=0.8) 
+
+#检验预测效果#
+pre_train<-predict(rtree)
+table(pre_train,train$MobDr1to11_od30)
+
+#检验test集预测效果#
+pre_test<-predict(rtree, newdata = test)
+table(pre_test, test$MobDr1to11_od30)
+
+#检验整体集预测效果#
+pre_dat<-predict(rtree, newdata = datt1)
+table(pre_dat, datt1$MobDr1to11_od30)
+```
+
+## 决策树选择的字段分布
+```{r}
+dat_jd_clean<-select(datt1,gmv_rstd,refund_amt,cash)
+summary(dat_jd_clean)
+```
+
+
+
+## 评价决策树
+### KS值
+```{r}
+result=datt1
+result$true_label=result$MobDr1to11_od30
+result$pre_prob=pre_dat
+#install.packages("gmodels")
+TPR <- NULL
+FPR <- NULL
+for(i in seq(from=1,to=0,by=-0.1)){
+  #判为正类实际也为正类
+  TP <- sum((result$pre_prob >= i) * (result$true_label == 1)) 
+  #判为正类实际为负类
+  FP <- sum((result$pre_prob >= i) * (result$true_label == 0))
+  #判为负类实际为负类
+  TN <- sum((result$pre_prob < i) * (result$true_label == 0)) 
+  #判为负类实际为正类
+  FN <- sum((result$pre_prob < i) * (result$true_label == 1)) 
+  TPR <- c(TPR,TP/(TP+FN))
+  FPR <- c(FPR,FP/(FP+TN))
+}
+
+max(TPR-FPR)#KS
+
+#library(ggplot2)
+ggplot(data=NULL,mapping = aes(x=seq(0,1,0.1),y=TPR))+
+  geom_point()+
+  geom_smooth(se=FALSE,formula = y ~ splines::ns(x,10), method ='lm')+
+  geom_line(mapping = aes(x=seq(0,1,0.1),y=FPR),linetype=6)
+
+```
+## 混肴矩阵
+
+```{r}
+# 找到KS值对应的切分点：
+for (i in seq(0,10,1)){
+  print(i)
+  print(TPR[i]-FPR[i])
+}
+## 混肴矩阵
+result$pre_to1<-ifelse(result$pre_prob>=0.7,1,0)
+#require(caret)
+xtab<-table(result$pre_to1,result$MobDr1to11_od30)
+confusionMatrix(xtab)
+```
+
+## ROC曲线及AUC
+```{r}
+## roc曲线及AUC
+#library(pROC)
+modelroc <- roc(datt1$MobDr1to11_od30,pre_dat)
+plot(modelroc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),
+     grid.col=c("green", "red"), max.auc.polygon=TRUE,
+     auc.polygon.col="skyblue", print.thres=TRUE)
+```
+
+```{r}
+#设置随机分配，查分数据为train集和test集#
+dat=datt1
+smp_size <- floor(0.5 * nrow(dat))
+train_ind <- sample(seq_len(nrow(dat)), size = smp_size)
+train_2 <- dat[train_ind, ]
+test_2 <- dat[-train_ind, ]
+dim(train_2)
+dim(test_2)
+
+#检验预测效果#
+pre_train_2<-predict(rtree,newdata=train_2)
+table(pre_train_2,train_2$MobDr1to11_od30)
+
+#检验test集预测效果#
+pre_test_2<-predict(rtree, newdata = test_2)
+table(pre_test_2, test_2$MobDr1to11_od30)
+
+modelroc <- roc(train_2$MobDr1to11_od30,pre_train_2)
+plot(modelroc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),
+     grid.col=c("green", "red"), max.auc.polygon=TRUE,
+     auc.polygon.col="skyblue", print.thres=TRUE)
+
+modelroc <- roc(test_2$MobDr1to11_od30,pre_test_2)
+plot(modelroc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),
+     grid.col=c("green", "red"), max.auc.polygon=TRUE,
+     auc.polygon.col="skyblue", print.thres=TRUE)
+```
+
+
+
